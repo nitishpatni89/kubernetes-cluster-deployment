@@ -1,0 +1,26 @@
+--> If your kubelet service is not coming up and giving error for wrong cgroup as default is systemd in latest Kubernetes version but you need to use cgroupfs as cgroup drive then you need to make following entry 
+
+In /etc/docker/daemon.json
+s
+{
+  "exec-opts": ["native.cgroupdriver=cgroupfs"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2",
+  "storage-opts": [
+    "overlay2.override_kernel_check=true"
+  ]
+}
+
+And then do systemctl daemon-reload and start the kubelet service and then try to init the kubeadm 
+
+
+--> If kubeadm will get error that port of etcd already in use, so do kubeadm reset, rm -rf /var/lig/etcd , stop etcd service and then init the kubeadm. And then restart the ETCD
+
+--> In componentstatuses controller and scheduler will be visible in error state so just comment - --port=0 in there respective configuration file 
+
+/etc/kubernetes/manifests/kube-controller-manager.yaml
+/etc/kubernetes/manifests/kube-scheduler.yaml
+
