@@ -1,0 +1,257 @@
+1)	Disable Swap and selinux on all the master node
+
+--> swappoff -a
+--> comment the swap line in /etc/fstab
+--> setenforce 0 && set disabled in /etc/selinux/config
+
+2)	Stop firewall
+
+--> systemctl stop firewalld
+--> systemctl disable firewalld
+
+3)	make host entries of each node in /etc/hosts
+
+4)	enable password less ssh authentication and also allow root login for ssh
+
+--> ssh-keygen -t rsa
+--> ssh-copy-id root@node1
+--> ssh-keygen -t rsa
+--> ssh-copy-id root@node2
+
+5)	install keepalived on both nodes node1,node2 and systemctl daemon-reload && systemctl enable keepalived && systemctl restart keepalived
+
+--> apt-get install keepalived -y
+--> update configuration file of keepalived with below in both node (replace ip for node 2) ##here 192.168.56.108/109 are main IP and VIP is 192.168.56.110
+
+cat /etc/keepalived/keepalived.conf 
+global_defs {
+router_id LVS_k8s
+}
+vrrp_instance VI_1 {
+state BACKUP
+interface enp0s8
+virtual_router_id 61
+priority 80
+advert_int 1
+mcast_src_ip 192.168.56.108
+nopreempt
+authentication {
+auth_type PASS
+auth_pass KEEPALIVED_AUTH_PASS
+}
+unicast_peer {
+192.168.56.109
+}
+virtual_ipaddress {
+192.168.56.110/24
+}
+track_script {
+CheckK8sMaster
+}
+}
+
+6)	download tool for certificate generation.
+
+--> wget https://pkg.cfssl.org/R1.2/cfssl_linux-amd64
+--> wget https://pkg.cfssl.org/R1.2/cfssljson_linux-amd64
+--> chmod +x cfssl*
+--> mv cfssl_linux-amd64 /usr/local/bin/cfssl
+--> mv cfssljson_linux-amd64 /usr/local/bin/cfssljson
+--> cfssl version
+
+7)	Create config file on node 1 for certification
+
+--> root@node1:~# cat ca-config.json
+{
+"signing": {
+"default": {
+"expiry": "8760h"
+},
+"profiles": {
+"kubernetes": {
+"usages": ["signing", "key encipherment", "server auth", "client auth"],
+"expiry": "8760h"
+}
+}
+}
+}
+
+8)	create signing authority certificate
+
+-->	root@node1:~# cat ca-csr.json
+{
+"CN": "Kubernetes",
+"key": {
+"algo": "rsa",
+"size": 2048
+},
+"names": [
+{
+"C": "IN",
+"L": "BGLR",
+"O": "Kubernetes",
+"OU": "CA",
+"ST": "Cisco."
+}
+]
+}
+
+9)	Generate certificate
+--> cfssl gencert -initca ca-csr.json | cfssljson -bare ca
+
+10)	create certificate for etcd cluster in node1
+
+--> root@node1:~# cat kubernetes-csr.json
+{
+"CN": "kubernetes",
+"key": {
+"algo": "rsa",
+"size": 2048
+},
+"names": [
+{
+"C": "IN",
+"L": "BGLR",
+"O": "Kubernetes",
+"OU": "CA",
+"ST": "Cisco."
+}
+]
+}
+
+11)	Generate certificate and private key
+
+cfssl gencert \
+-ca=ca.pem \
+-ca-key=ca-key.pem \
+-config=ca-config.json \
+-hostname=192.168.56.108,192.168.56.109,192.168.56.110,127.0.0.1,kubernetes.default \
+-profile=kubernetes kubernetes-csr.json | \
+cfssljson -bare Kubernetes
+
+12)	Now copy certificate to node 2 
+
+--> scp ca.pem kubernetes.pem kubernetes-key.pem root@bpa-master2:~
+--> cp ca.pem kubernetes.pem kubernetes-key.pem ~
+
+13)	Install and configure ETCD on both node1 and node 2 
+
+--> 	mkdir /etc/etcd /var/lib/etcd
+--> 	mv ~/ca.pem ~/kubernetes.pem ~/kubernetes-key.pem /etc/etcd
+--> wget https://github.com/etcd-io/etcd/releases/download/v3.3.10/etcd-v3.3.10-linux-amd64.tar.gz
+--> tar xvzf etcd-v3.3.10-linux-amd64.tar.gz
+--> mv etcd-v3.3.10-linux-amd64/etcd* /usr/local/bin/
+--> vi /etc/systemd/system/etcd.service              ///change the ip’s of node for node2///
+[Unit]
+Description=etcd
+Documentation=https://github.com/coreos
+[Service]
+ExecStart=/usr/local/bin/etcd \
+--name 192.168.56.108 \
+--cert-file=/etc/etcd/kubernetes.pem \
+--key-file=/etc/etcd/kubernetes-key.pem \
+--peer-cert-file=/etc/etcd/kubernetes.pem \
+--peer-key-file=/etc/etcd/kubernetes-key.pem \
+--trusted-ca-file=/etc/etcd/ca.pem \
+--peer-trusted-ca-file=/etc/etcd/ca.pem \
+--peer-client-cert-auth \
+--client-cert-auth \
+--initial-advertise-peer-urls https://192.168.56.108:2380 \
+--listen-peer-urls https://192.168.56.108:2380 \
+--listen-client-urls https://192.168.56.108:2379,http://127.0.0.1:2379 \
+--advertise-client-urls https://192.168.56.108:2379 \
+--initial-cluster-token etcd-cluster-0 \
+--initial-cluster 192.168.56.108=https://192.168.56.108:2380,192.168.56.109=https://192.168.56.109:2380 \
+--initial-cluster-state new \
+--data-dir=/var/lib/etcd
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+
+--> systemctl daemon-reload && systemctl enable etcd && systemctl start etcd
+--> ETCDCTL_API=3 etcdctl member list
+
+14)	Now configure configuration file for Kubernetes on node 1 and install necessary binaries 
+
+--> vi config.yaml
+apiVersion: kubeadm.k8s.io/v1beta2
+kind: ClusterConfiguration
+kubernetesVersion: stable
+apiServerCertSANs:
+- 192.168.56.110
+controlPlaneEndpoint: "192.168.56.110:6443"
+etcd:
+external:
+endpoints:
+- https://192.168.56.108:2379
+- https://192.168.56.109:2379
+caFile: /etc/etcd/ca.pem
+certFile: /etc/etcd/kubernetes.pem
+keyFile: /etc/etcd/kubernetes-key.pem
+networking:
+podSubnet: 10.244.0.0/16
+apiServerExtraArgs:
+apiserver-count: "3"
+
+15) install Kubernetes binaries and docker on both nodes
+--> https://docs.docker.com/engine/install/ubuntu/    ##follow this to install docker##
+--> curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add
+--> echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" >> ~/kubernetes.list
+--> sudo mv ~/kubernetes.list /etc/apt/sources.list.d
+--> apt-get update -y
+--> apt-get install -y kubeadm=1.21.6-00 kubelet=1.21.6-00 kubectl=1.21.6-00
+--> modprobe br_netfilte
+--> echo '1' > /proc/sys/net/bridge/bridge-nf-call-iptables
+--> sysctl net.bridge.bridge-nf-call-iptables=1
+
+16) steps to be performed from node1
+
+--> kubeadm config migrate --old-config config.yaml --new-config config-new.yaml
+--> rm -rf /var/lib/etcd
+--> kubeadm init --config=config-new.yaml
+--> mkdir -p $HOME/.kube
+--> sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+--> sudo chown $(id -u):$(id -g) $HOME/.kube/config
+--> scp -r /etc/kubernetes/pki root@node2:~
+--> scp -r config.yaml root@node2:~
+
+17) steps to be perform from  node2
+
+--> rm ~/pki/apiserver.*
+--> mv ~/pki /etc/kubernetes/
+--> kubeadm config migrate --old-config config.yaml --new-config config-new.yaml
+--> rm -rf /var/lib/etcd
+--> kubeadm init --config=config-new.yaml
+--> mkdir -p $HOME/.kube
+--> sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+--> sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+18) Deploy calico on node 1
+
+--> curl https://docs.projectcalico.org/manifests/calico.yaml -O
+--> kubectl apply -f calico.yaml
+
+19) Apply taints on any one of the master node 
+
+--> kubectl taint nodes --all node-role.kubernetes.io/master-
+
+20) Add lables to the node 
+
+--> Kubectl label node node1 name=node-1
+--> Kubectl label node bnode2 name=node-2
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
